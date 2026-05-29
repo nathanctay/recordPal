@@ -1,4 +1,4 @@
-# Shazablet
+# RecordPal (may change)
 
 An always-on, zero-interaction music identification appliance. Sits next to a record player or radio, listens continuously, and displays the current track, artist, album art, and metadata on a dedicated screen. No tapping. No phones.
 
