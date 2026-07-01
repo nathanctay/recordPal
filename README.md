@@ -20,17 +20,17 @@ Microphone → [audio-worker (Rust)] → Unix Socket → [now-playing-service (G
 
 ### `audio/` — Audio Worker (Rust)
 
-The "ears" of the system. A lightweight native process responsible only for capturing audio and producing fingerprints.
+The "ears" of the system. A lightweight native process responsible only for capturing audio and sending short audio clips.
 
 **Responsibilities:**
 - Captures raw PCM audio via ALSA
 - Maintains a ring buffer to decouple capture rate from processing rate
 - Calculates RMS amplitude; skips silent windows to avoid wasted CPU and API calls
-- Generates Chromaprint acoustic fingerprints from valid audio windows (6–10 seconds)
-- Serializes fingerprint data as NDJSON and writes to a Unix Domain Socket
+- Encodes the captured window as a self-contained WAV clip (e.g. ~10s, mono 16 kHz 16-bit)
+- Frames a small JSON header + the raw WAV bytes over the socket
 - Reconnects automatically if the Go service restarts
 
-**Key crates:** `cpal` (cross-platform audio I/O), `rustfft`, `chromaprint` bindings, `serde_json`, `tracing`
+**Key crates:** `cpal` (cross-platform audio I/O), `serde_json`, `tracing`, `hound`
 
 ---
 
@@ -39,14 +39,14 @@ The "ears" of the system. A lightweight native process responsible only for capt
 The "brain" of the system. Handles all application logic, external API calls, persistence, and serves the frontend.
 
 **Responsibilities:**
-- Listens on a Unix Domain Socket for the NDJSON stream from the audio worker
-- Debounces: if the incoming fingerprint matches the current track, updates a `last_heard` timestamp and skips API lookups
-- Queries AcoustID / MusicBrainz / Spotify only when a genuinely new track is detected
-- Caches results in SQLite to avoid re-querying known tracks and to survive network outages
+- Receives framed audio clips (JSON header + WAV bytes) from the audio worker
+- Queries AudD (which returns Spotify/Apple Music/MusicBrainz metadata + album art in one call)
+- Debounces: compares each AudD result to the current track, broadcasting only when the track changes — otherwise it just bumps `last_heard` and resets the idle timer
+- Caches results in SQLite to survive network outages
 - Manages a TTL: if no audio is detected for 5 minutes, broadcasts an `idle` event to the UI
 - Hosts the frontend static files and provides an SSE endpoint for real-time UI updates
 
-**Key packages:** `net/http` (stdlib router), `modernc.org/sqlite`, `encoding/json`
+**Key packages:** `net/http` (stdlib router), `modernc.org/sqlite`, `encoding/json`, `mime/multipart`
 
 ---
 
@@ -63,15 +63,17 @@ A full-screen kiosk interface running in Chromium on the device. Connects to the
 
 ## IPC Protocol
 
-Components communicate using **NDJSON (Newline Delimited JSON)** over a Unix Domain Socket at `/tmp/nowplaying.sock`.
+Components communicate over a Unix Domain Socket at `/tmp/nowplaying.sock` using a simple framed protocol: a single newline-terminated JSON header describing the clip, immediately followed by the raw audio bytes.
 
-NDJSON was chosen over binary protocols (protobuf, msgpack) because it is trivially debuggable with standard tools like `nc` and `cat`, requires no build steps or schema compilation, and is lightweight enough for this use case.
+A text header keeps the metadata easy to inspect and evolve without a schema compiler, while sending the audio as raw bytes (rather than base64) avoids ~33% encoding overhead on every clip. The header's `bytes` field tells the reader exactly how many bytes of audio follow, so the Go side reads the header line and then reads that many bytes with `io.ReadFull`.
 
-Each message from the audio worker is one JSON object per line:
+Each clip is sent as a JSON header line:
 
 ```json
-{"type": "fingerprint", "payload": "AQAAz0mUCJGi...", "duration_ms": 7500, "rms_energy": 0.045}
+{"type": "clip", "format": "wav", "duration_s": 10, "rms_energy": 0.045, "bytes": 320044}
 ```
+
+…followed immediately by `bytes` bytes of WAV audio (header + PCM).
 
 The Go service responds by broadcasting SSE events to connected UI clients.
 
@@ -80,14 +82,15 @@ The Go service responds by broadcasting SSE events to connected UI clients.
 ## Data Flow
 
 ```
-1. Capture    Microphone → ALSA → Rust ring buffer
-2. Filter     RMS check → drop if silent, pass if audio detected
-3. Fingerprint Chromaprint generates fingerprint string
-4. Transport  Rust serializes to NDJSON → writes to /tmp/nowplaying.sock
-5. Ingest     Go service decodes stream
-6. Logic      Same song as last 10s? → reset idle timer only
-              New song?              → check SQLite cache → (miss) call API → update DB
-7. Broadcast  Go SSE endpoint pushes track data to React UI
+1. Capture     Microphone → ALSA → Rust ring buffer
+2. Filter      RMS check → drop if silent, pass if audio detected
+3. Encode      Wrap captured PCM window as a WAV clip
+4. Transport   Rust frames JSON header + WAV bytes → socket
+5. Ingest      Go reads the header, then the WAV bytes
+6. Identify    Go sends the clip to AudD, gets the matched track
+7. Logic       Same track as current? → bump last_heard, reset idle timer
+               New track?             → update current, write history, broadcast
+8. Broadcast   Go SSE endpoint pushes track data to React UI
 ```
 
 ---
@@ -98,11 +101,10 @@ The Go service responds by broadcasting SSE events to connected UI clients.
 
 | Table | Columns |
 |-------|---------|
-| `tracks` | `id`, `title`, `artist`, `album`, `album_art_url`, `fingerprint_hash` |
+| `tracks` | `id`, `title`, `artist`, `album`, `album_art_url` |
 | `history` | `id`, `track_id`, `first_heard`, `last_heard` |
-| `kv_store` | `key`, `value` — API keys, config tokens |
 
-The local cache prevents redundant API calls when the same track is heard again (e.g. replaying the same album). History is stored for future features like a "recently played" view.
+Recognized tracks and their metadata are cached so the current song and history stay available during network outages. Because a clip can only be identified by calling AudD, the cache is not used to skip identification requests — it exists for offline resilience and history (e.g. a future "recently played" view).
 
 ---
 
@@ -141,8 +143,8 @@ sudo journalctl -u audio-worker -f   # tail logs for any unit
 ## Repo Structure
 
 ```
-shazablet/
-├── audio/          # Rust — audio capture and fingerprinting
+recordPal/
+├── audio/          # Rust — audio capture and clip transmission
 ├── middleware/      # Go — identification service and web server
 ├── ui/             # React — kiosk display
 ├── deploy/         # systemd unit files, install scripts
@@ -153,31 +155,6 @@ shazablet/
 
 ---
 
-## Development Roadmap
-
-### Phase 1 — Pipeline (PoC)
-- [ ] Rust captures audio and prints NDJSON fingerprints to stdout
-- [ ] Go reads stdin and logs "fingerprint received"
-- [ ] Verify end-to-end data shape before wiring anything together
-
-### Phase 2 — Socket & Identification
-- [ ] Connect Rust → Go via Unix Domain Socket
-- [ ] Implement AcoustID / MusicBrainz lookup in Go
-- [ ] Basic SSE endpoint returning raw JSON to a browser
-
-### Phase 3 — UI & Persistence
-- [ ] SQLite caching layer
-- [ ] React frontend: track display, album art, idle state
-- [ ] Chromium kiosk setup on Pi
-
-### Phase 4 — Hardening
-- [ ] Tune RMS silence threshold for real-world room noise
-- [ ] Idle TTL logic and clock/screensaver state
-- [ ] Handle network outages gracefully (queue or serve from cache)
-- [ ] Dockerized cross-compile + deploy pipeline
-
----
-
 ## Privacy
 
-Audio is processed entirely on-device. Raw audio is never transmitted anywhere. Only the generated fingerprint string (a compact numeric hash with no recoverable audio content) is sent to external identification APIs.
+Audio is captured on-device and a short clip is sent over an encrypted connection to our music-identification provider (AudD) solely to identify the track. Per their policy, the clip is fingerprinted and then permanently discarded — only the derived fingerprint (which contains no recoverable audio) is retained on their side. No audio is stored on the device.

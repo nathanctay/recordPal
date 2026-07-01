@@ -1,2 +1,4 @@
+github.com/AudDMusic/audd-go v1.5.17 h1:0CYn5dP0AyNivkvKXPMqfCzq+9qsCAjmqB2TNNb5uxY=
+github.com/AudDMusic/audd-go v1.5.17/go.mod h1:1uweVvbQsjYnnUwKZu9n7pvqANQ4SMpvMrcjQHz2X0c=
 github.com/joho/godotenv v1.5.1 h1:7eLL/+HRGLY0ldzfGMeQkb7vMd0as4CfYvUVzLqw0N0=
 github.com/joho/godotenv v1.5.1/go.mod h1:f4LDr5Voq0i2e/R5DDNOoa2zzDfwtkZa6DnEwAbqwq4=

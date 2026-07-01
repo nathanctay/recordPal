@@ -7,62 +7,50 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
+	audd "github.com/AudDMusic/audd-go"
 	"github.com/joho/godotenv"
 )
 
-type FingerprintData struct {
+type RecordingData struct {
 	Payload   string  `json:"payload"`
 	DurationS int     `json:"duration_s"`
 	RmsEnergy float32 `json:"rms_energy"`
 }
 
 type Track struct {
-	Title     string `json:"title"`
-	Artist    string `json:"artist"`
-	DurationS int    `json:"duration_s"`
+	Album         string                     `json:"album"`
+	AlbumCoverURL string                     `json:"album_cover_url"`
+	Artist        string                     `json:"artist"`
+	DurationS     int                        `json:"duration_s"`
+	Extras        map[string]json.RawMessage `json:"extras"`
+	ISRC          string                     `json:"isrc,omitempty"`
+	ReleaseDate   string                     `json:"release_date"`
+	Title         string                     `json:"title"`
 	// Progress int POTENTIALLY HAVE IT RETURN WHERE IN THE SONG THEY ARE TO DISPLAY SONG PROGRESS
-	Album         string `json:"album"`
-	AlbumCoverURL string `json:"album_cover_url"`
 	// Trivia []string
 }
 
-type Artist struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
+// type MusicBrainzEntry struct {
+// 	Length int                        `json:"length,omitempty"`
+// 	Extras map[string]json.RawMessage `json:"-"`
+// }
 
-type ReleaseGroup struct {
-	ID             string   `json:"id"`
-	Title          string   `json:"title"`
-	Type           string   `json:"type"`
-	SecondaryTypes []string `json:"secondarytypes"`
-	Artists        []Artist `json:"artists"`
-}
-
-type Recording struct {
-	ID            string         `json:"id"`
-	Title         string         `json:"title"`
-	Duration      float64        `json:"duration"`
-	Artists       []Artist       `json:"artists"`
-	ReleaseGroups []ReleaseGroup `json:"releasegroups"`
-}
-
-type AcoustIDResponse struct {
-	Status  string `json:"status"`
-	Results []struct {
-		ID         string      `json:"id"`
-		Score      float64     `json:"score"`
-		Recordings []Recording `json:"recordings"`
-	} `json:"results"`
-}
+// type AudDResponse struct {
+// 	Status string `json:"status"`
+// 	Result []struct {
+// 		Artist      string             `json:"artist"`
+// 		Title       string             `json:"title"`
+// 		Album       string             `json:"album"`
+// 		ReleaseDate string             `json:"release_date"`
+// 		MusicBrainz []MusicBrainzEntry `json:"musicbrainz,omitempty"`
+// 	} `json:"result"`
+// }
 
 type IdentifierState string
 
@@ -79,10 +67,16 @@ func init() {
 	}
 }
 
+var audDClient *audd.Client
+
 func main() {
-	if _, ok := os.LookupEnv("ACOUSTID_API_KEY"); !ok {
-		log.Fatal("ACOUSTID_API_KEY is not set")
+	audDApiKey, ok := os.LookupEnv("AUDD_API_KEY")
+	if !ok {
+		log.Fatal("AUDD_API_KEY is not set")
 	}
+
+	audDClient = audd.NewClient(audDApiKey)
+	defer audDClient.Close()
 
 	mux := http.NewServeMux()
 	eventBroker := newBroker[Track]()
@@ -135,7 +129,7 @@ func handleIdentify(trackBroker *SSEBroker[Track], stateBroker *SSEBroker[Identi
 
 				idleTimer.Reset(idleTimeout)
 
-				var req FingerprintData
+				var req RecordingData
 				err := json.Unmarshal(scanner.Bytes(), &req)
 
 				if err != nil {
@@ -166,76 +160,109 @@ func handleIdentify(trackBroker *SSEBroker[Track], stateBroker *SSEBroker[Identi
 	}
 }
 
-var acoustidClient = &http.Client{Timeout: 10 * time.Second}
-
-func identifySong(fingerprint FingerprintData) (Track, error) {
-	acoustidApiKey, exists := os.LookupEnv("ACOUSTID_API_KEY")
-
-	if !exists {
-		return Track{}, fmt.Errorf("Acoustid Api key is not set")
-	}
-
-	params := url.Values{}
-	params.Set("client", acoustidApiKey)
-	params.Set("duration", strconv.Itoa(fingerprint.DurationS))
-	params.Set("fingerprint", fingerprint.Payload)
-	params.Set("meta", "recordings releasegroups")
-
-	endpoint := "https://api.acoustid.org/v2/lookup?" + params.Encode()
-
-	resp, err := acoustidClient.Get(endpoint)
+func identifySong(recording RecordingData) (Track, error) {
+	resp, err := audDClient.Recognize("PLACEHOLDER TEXT", &audd.RecognizeOptions{ //TODO: Replace placeholder
+		ReturnMetadata: "spotify,musicbrainz",
+	})
 	if err != nil {
 		return Track{}, fmt.Errorf("error getting song info: %w", err)
 	}
-	defer resp.Body.Close()
 
-	var result AcoustIDResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return Track{}, fmt.Errorf("error decoding song info: %w", err)
+	if resp == nil {
+		fmt.Println("no match")
+		return Track{}, nil // maybe change status to idle? TODO: Come back to this
 	}
 
-	if result.Status != "ok" || len(result.Results) == 0 {
-		return Track{}, fmt.Errorf("no match found")
-	}
-
-	// Pick the result with the highest score that actually has a recording.
-	best := -1
-	for i, r := range result.Results {
-		if len(r.Recordings) == 0 {
-			continue
-		}
-		if best == -1 || r.Score > result.Results[best].Score {
-			best = i
-		}
-	}
-
-	if best == -1 {
-		return Track{}, fmt.Errorf("no match found")
-	}
-
-	rec := result.Results[best].Recordings[0]
+	fmt.Println(string(resp.RawResponse))
+	b, _ := json.MarshalIndent(resp, "", "  ")
+	fmt.Println(string(b))
 
 	track := Track{
-		Title:     rec.Title,
-		DurationS: int(rec.Duration),
+		Album:         resp.Album,
+		Artist:        resp.Artist,
+		AlbumCoverURL: resp.ThumbnailURL(),
+		ISRC:          resp.ISRC,
+		ReleaseDate:   resp.ReleaseDate,
+		Title:         resp.Title,
 	}
 
-	if len(rec.Artists) > 0 {
-		track.Artist = rec.Artists[0].Name
-	}
+	if resp.Spotify != nil {
+		if resp.Spotify.DurationMs > 0 {
+			track.DurationS = resp.Spotify.DurationMs / 1000
+		}
 
-	// Prefer a primary studio album, otherwise fall back to the first release group.
-	if len(rec.ReleaseGroups) > 0 {
-		chosen := rec.ReleaseGroups[0]
-		for _, rg := range rec.ReleaseGroups {
-			if rg.Type == "Album" && len(rg.SecondaryTypes) == 0 {
-				chosen = rg
-				break
+		// Album name, release date, and cover art live in the nested "album"
+		// object, which the SDK leaves in Extras as raw JSON.
+		if raw, ok := resp.Spotify.Extras["album"]; ok {
+			var album struct {
+				Name        string `json:"name"`
+				AlbumType   string `json:"album_type"`
+				ReleaseDate string `json:"release_date"`
+				Images      []struct {
+					URL string `json:"url"`
+				} `json:"images"`
+			}
+			if json.Unmarshal(raw, &album) == nil {
+				fmt.Printf("spotify album: %q (type: %s)\n", album.Name, album.AlbumType)
+				if album.Name != "" {
+					track.Album = album.Name
+				}
+				if album.ReleaseDate != "" {
+					track.ReleaseDate = album.ReleaseDate
+				}
+				// Spotify orders album images largest-first.
+				if len(album.Images) > 0 && album.Images[0].URL != "" {
+					track.AlbumCoverURL = album.Images[0].URL
+				}
 			}
 		}
-		track.Album = chosen.Title
-		// AcoustID doesn't return cover art, but the release-group MBID maps to one in the Cover Art Archive.
-		track.AlbumCoverURL = fmt.Sprintf("https://coverartarchive.org/release-group/%s/front", chosen.ID)
+	}
+
+	// MusicBrainz lists every release this recording appears on. AudD defaults to
+	// whichever release it indexed (often a soundtrack or compilation), so prefer
+	// the original studio album: primary-type "Album" with no secondary types
+	// (Compilation, Soundtrack, etc.), favoring an official pressing.
+	if len(resp.MusicBrainz) > 0 {
+		if resp.MusicBrainz[0].Length > 0 {
+			track.DurationS = resp.MusicBrainz[0].Length / 1000 // milliseconds
+		}
+
+		if raw, ok := resp.MusicBrainz[0].Extras["releases"]; ok {
+			var releases []struct {
+				Date         string `json:"date"`
+				Status       string `json:"status"`
+				ReleaseGroup struct {
+					ID             string   `json:"id"`
+					Title          string   `json:"title"`
+					PrimaryType    string   `json:"primary-type"`
+					SecondaryTypes []string `json:"secondary-types"`
+				} `json:"release-group"`
+			}
+			if json.Unmarshal(raw, &releases) == nil {
+				best := -1
+				for i := range releases {
+					rg := releases[i].ReleaseGroup
+					if rg.PrimaryType != "Album" || len(rg.SecondaryTypes) > 0 {
+						continue // skip singles, compilations, soundtracks
+					}
+					if best == -1 {
+						best = i // first studio album is the fallback
+					}
+					if releases[i].Status == "Official" {
+						best = i // prefer an official pressing
+						break
+					}
+				}
+				if best != -1 {
+					rg := releases[best].ReleaseGroup
+					track.Album = rg.Title
+					if releases[best].Date != "" {
+						track.ReleaseDate = releases[best].Date
+					}
+					track.AlbumCoverURL = "https://coverartarchive.org/release-group/" + rg.ID + "/front"
+				}
+			}
+		}
 	}
 
 	return track, nil
