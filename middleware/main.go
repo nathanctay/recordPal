@@ -172,10 +172,6 @@ func identifySong(audio []byte) (Track, error) {
 		return Track{}, nil // maybe change status to idle? TODO: Come back to this
 	}
 
-	fmt.Println(string(resp.RawResponse))
-	b, _ := json.MarshalIndent(resp, "", "  ")
-	fmt.Println(string(b))
-
 	track := Track{
 		Album:         resp.Album,
 		Artist:        resp.Artist,
