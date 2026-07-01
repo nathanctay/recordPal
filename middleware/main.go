@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -17,10 +18,12 @@ import (
 	"github.com/joho/godotenv"
 )
 
-type RecordingData struct {
-	Payload   string  `json:"payload"`
-	DurationS int     `json:"duration_s"`
-	RmsEnergy float32 `json:"rms_energy"`
+type ClipHeader struct {
+	Type      string  `json:"type"`
+	Format    string  `json:"format"`
+	DurationS int     `json:"duration_s"` // clip length (~10s), informational
+	RmsEnergy float32 `json:"rms_energy"` // informational
+	Bytes     int     `json:"bytes"`      // length of the WAV payload that follows
 }
 
 type Track struct {
@@ -35,22 +38,6 @@ type Track struct {
 	// Progress int POTENTIALLY HAVE IT RETURN WHERE IN THE SONG THEY ARE TO DISPLAY SONG PROGRESS
 	// Trivia []string
 }
-
-// type MusicBrainzEntry struct {
-// 	Length int                        `json:"length,omitempty"`
-// 	Extras map[string]json.RawMessage `json:"-"`
-// }
-
-// type AudDResponse struct {
-// 	Status string `json:"status"`
-// 	Result []struct {
-// 		Artist      string             `json:"artist"`
-// 		Title       string             `json:"title"`
-// 		Album       string             `json:"album"`
-// 		ReleaseDate string             `json:"release_date"`
-// 		MusicBrainz []MusicBrainzEntry `json:"musicbrainz,omitempty"`
-// 	} `json:"result"`
-// }
 
 type IdentifierState string
 
@@ -115,8 +102,8 @@ func handleIdentify(trackBroker *SSEBroker[Track], stateBroker *SSEBroker[Identi
 		go func(conn net.Conn) {
 			defer conn.Close()
 
-			scanner := bufio.NewScanner(conn)
-			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // up to 1MB lines
+			reader := bufio.NewReaderSize(conn, 64*1024) // up to 1MB lines
+			const maxClipBytes = 10 << 20                // 10 MB — AudD's hard limit; reject anything larger
 
 			const idleTimeout = 30 * time.Second
 			// switch our listening status to idle after 30 seconds
@@ -125,22 +112,38 @@ func handleIdentify(trackBroker *SSEBroker[Track], stateBroker *SSEBroker[Identi
 			})
 			defer idleTimer.Stop()
 
-			for scanner.Scan() {
-
-				idleTimer.Reset(idleTimeout)
-
-				var req RecordingData
-				err := json.Unmarshal(scanner.Bytes(), &req)
-
+			for {
+				//get the header line
+				headerLine, err := reader.ReadBytes('\n')
 				if err != nil {
-					log.Println("error parsing request JSON:", err)
-					continue
+					if err != io.EOF {
+						log.Println("error reading header:", err)
+					}
+					return // conn closed or broken; Rust will reconnect
 				}
 
+				var hdr ClipHeader
+				if err := json.Unmarshal(headerLine, &hdr); err != nil {
+					log.Println("bad header, closing conn:", err)
+					return // can't recover: we don't know how many payload bytes to skip
+				}
+				if hdr.Bytes <= 0 || hdr.Bytes > maxClipBytes {
+					log.Println("implausible clip size, closing conn:", hdr.Bytes)
+					return
+				}
+
+				// grab hdr.Bytes of audio
+				audio := make([]byte, hdr.Bytes)
+				if _, err := io.ReadFull(reader, audio); err != nil {
+					log.Println("error reading audio payload:", err)
+					return
+				}
+
+				idleTimer.Reset(idleTimeout)
 				stateBroker.publish(StateIdentifying) // find the best place to do this
 
 				//identify the song
-				track, err := identifySong(req)
+				track, err := identifySong(audio)
 				if err != nil {
 					log.Println("error identifying song:", err)
 					stateBroker.publish(StateError)
@@ -151,17 +154,13 @@ func handleIdentify(trackBroker *SSEBroker[Track], stateBroker *SSEBroker[Identi
 				trackBroker.publish(track)
 				stateBroker.publish(StateListening)
 			}
-
-			if err := scanner.Err(); err != nil {
-				log.Println("scanner error:", err)
-			}
 		}(conn)
 
 	}
 }
 
-func identifySong(recording RecordingData) (Track, error) {
-	resp, err := audDClient.Recognize("PLACEHOLDER TEXT", &audd.RecognizeOptions{ //TODO: Replace placeholder
+func identifySong(audio []byte) (Track, error) {
+	resp, err := audDClient.Recognize(audio, &audd.RecognizeOptions{
 		ReturnMetadata: "spotify,musicbrainz",
 	})
 	if err != nil {
