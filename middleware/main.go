@@ -102,8 +102,8 @@ func handleIdentify(trackBroker *SSEBroker[Track], stateBroker *SSEBroker[Identi
 		go func(conn net.Conn) {
 			defer conn.Close()
 
-			reader := bufio.NewReaderSize(conn, 64*1024) // up to 1MB lines
-			const maxClipBytes = 10 << 20                // 10 MB — AudD's hard limit; reject anything larger
+			reader := bufio.NewReaderSize(conn, 64*1024)
+			const maxClipBytes = 10 << 20 // 10 MB — AudD's hard limit; reject anything larger
 
 			const idleTimeout = 30 * time.Second
 			// switch our listening status to idle after 30 seconds
