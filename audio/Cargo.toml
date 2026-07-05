@@ -1,0 +1,9 @@
+[package]
+name = "audio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.18.1"
+hound = "3.5.1"
+json = "0.12.4"
