@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,6 +18,13 @@ import (
 	audd "github.com/AudDMusic/audd-go"
 	"github.com/joho/godotenv"
 )
+
+var (
+	errBadClipHeader       = errors.New("bad clip header")
+	errImplausibleClipSize = errors.New("implausible clip size")
+)
+
+const maxClipBytes = 10 << 20 // 10 MB — AudD's hard limit
 
 type ClipHeader struct {
 	Type      string  `json:"type"`
@@ -103,7 +111,6 @@ func handleIdentify(trackBroker *SSEBroker[Track], stateBroker *SSEBroker[Identi
 			defer conn.Close()
 
 			reader := bufio.NewReaderSize(conn, 64*1024)
-			const maxClipBytes = 10 << 20 // 10 MB — AudD's hard limit; reject anything larger
 
 			const idleTimeout = 30 * time.Second
 			// switch our listening status to idle after 30 seconds
@@ -113,29 +120,11 @@ func handleIdentify(trackBroker *SSEBroker[Track], stateBroker *SSEBroker[Identi
 			defer idleTimer.Stop()
 
 			for {
-				//get the header line
-				headerLine, err := reader.ReadBytes('\n')
+				audio, err := readClip(reader)
 				if err != nil {
 					if err != io.EOF {
-						log.Println("error reading header:", err)
+						log.Println("error reading clip:", err)
 					}
-					return // conn closed or broken; Rust will reconnect
-				}
-
-				var hdr ClipHeader
-				if err := json.Unmarshal(headerLine, &hdr); err != nil {
-					log.Println("bad header, closing conn:", err)
-					return // can't recover: we don't know how many payload bytes to skip
-				}
-				if hdr.Bytes <= 0 || hdr.Bytes > maxClipBytes {
-					log.Println("implausible clip size, closing conn:", hdr.Bytes)
-					return
-				}
-
-				// grab hdr.Bytes of audio
-				audio := make([]byte, hdr.Bytes)
-				if _, err := io.ReadFull(reader, audio); err != nil {
-					log.Println("error reading audio payload:", err)
 					return
 				}
 
@@ -172,6 +161,31 @@ func identifySong(audio []byte) (Track, error) {
 		return Track{}, nil // maybe change status to idle? TODO: Come back to this
 	}
 
+	return buildTrack(resp), nil
+}
+
+func readClip(r *bufio.Reader) ([]byte, error) {
+	headerLine, err := r.ReadBytes('\n')
+	if err != nil {
+		return nil, err
+	}
+
+	var hdr ClipHeader
+	if err := json.Unmarshal(headerLine, &hdr); err != nil {
+		return nil, fmt.Errorf("%w: %v", errBadClipHeader, err)
+	}
+	if hdr.Bytes <= 0 || hdr.Bytes > maxClipBytes {
+		return nil, fmt.Errorf("%w: %d", errImplausibleClipSize, hdr.Bytes)
+	}
+
+	audio := make([]byte, hdr.Bytes)
+	if _, err := io.ReadFull(r, audio); err != nil {
+		return nil, err
+	}
+	return audio, nil
+}
+
+func buildTrack(resp *audd.Recognition) Track {
 	track := Track{
 		Album:         resp.Album,
 		Artist:        resp.Artist,
@@ -198,7 +212,6 @@ func identifySong(audio []byte) (Track, error) {
 				} `json:"images"`
 			}
 			if json.Unmarshal(raw, &album) == nil {
-				fmt.Printf("spotify album: %q (type: %s)\n", album.Name, album.AlbumType)
 				if album.Name != "" {
 					track.Album = album.Name
 				}
@@ -260,7 +273,7 @@ func identifySong(audio []byte) (Track, error) {
 		}
 	}
 
-	return track, nil
+	return track
 }
 
 type SSEBroker[E Track | IdentifierState] struct {

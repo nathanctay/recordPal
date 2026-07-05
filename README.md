@@ -120,16 +120,17 @@ Builds are handled by a Dockerized cross-compilation pipeline targeting `linux/a
 
 ```bash
 make build-all      # cross-compile Rust + Go for linux/arm64
-make deploy         # rsync binaries + assets to Pi over SSH
+make deploy         # fetch wifi-connect + rsync binaries + assets to Pi over SSH
 ```
 
 ### Services (systemd)
 
-Three systemd units manage the processes on the device:
+Four systemd units manage the processes on the device:
 
 | Unit | Description |
 |------|-------------|
-| `now-playing.service` | Go service. Owns the socket file. Starts first. |
+| `wifi-connect.service` | Balena wifi-connect. Opens a WiFi setup portal when offline; exits once connected. Runs before the app units. |
+| `now-playing.service` | Go service. Owns the socket file. Starts after networking is up. |
 | `audio-worker.service` | Rust binary. Depends on `now-playing.service`. |
 | `kiosk.service` | Starts X11/Wayland + Chromium in kiosk mode. |
 
@@ -137,6 +138,14 @@ Three systemd units manage the processes on the device:
 sudo systemctl start now-playing audio-worker kiosk
 sudo journalctl -u audio-worker -f   # tail logs for any unit
 ```
+
+### Network Provisioning
+
+On first boot — or any time no known WiFi is in range — the Pi needs a way to receive WiFi credentials without a keyboard attached. We use [balena wifi-connect](https://github.com/balena-os/wifi-connect), a standalone binary that brings up a temporary `RecordPal-Setup` access point and serves a captive portal: connect a phone, pick your network, enter the password, and the Pi saves it via NetworkManager and reconnects automatically on every subsequent boot.
+
+wifi-connect is a prebuilt tool we run as-is, not something we compile — `make deploy` downloads the `aarch64` release and installs it alongside our own binaries. It runs as the `wifi-connect.service` unit, which only opens the portal when the device is offline; once a connection succeeds it exits and the app services start.
+
+> **Future:** wifi-connect is a pragmatic starting point. Down the line we may replace it with our own Go implementation — NetworkManager over D-Bus via [`gonetworkmanager`](https://github.com/Wifx/gonetworkmanager) plus a portal served by the existing `net/http` stack — so the setup screen matches RecordPal's look and we drop the external dependency.
 
 ---
 
