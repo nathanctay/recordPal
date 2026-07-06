@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -185,6 +186,28 @@ func readClip(r *bufio.Reader) ([]byte, error) {
 	return audio, nil
 }
 
+type spotifyArtist struct {
+	Name string `json:"name"`
+}
+
+type spotifyImage struct {
+	URL string `json:"url"`
+}
+
+// isCompilation reports whether a Spotify album is a various-artists compilation
+// (a "Pure... Dance Party"-style release) rather than the song's real album.
+func isCompilation(albumType string, artists []spotifyArtist) bool {
+	if strings.EqualFold(albumType, "compilation") {
+		return true
+	}
+	for _, a := range artists {
+		if strings.EqualFold(a.Name, "Various Artists") {
+			return true
+		}
+	}
+	return false
+}
+
 func buildTrack(resp *audd.Recognition) Track {
 	track := Track{
 		Album:         resp.Album,
@@ -204,14 +227,16 @@ func buildTrack(resp *audd.Recognition) Track {
 		// object, which the SDK leaves in Extras as raw JSON.
 		if raw, ok := resp.Spotify.Extras["album"]; ok {
 			var album struct {
-				Name        string `json:"name"`
-				AlbumType   string `json:"album_type"`
-				ReleaseDate string `json:"release_date"`
-				Images      []struct {
-					URL string `json:"url"`
-				} `json:"images"`
+				Name        string          `json:"name"`
+				AlbumType   string          `json:"album_type"`
+				ReleaseDate string          `json:"release_date"`
+				Artists     []spotifyArtist `json:"artists"`
+				Images      []spotifyImage  `json:"images"`
 			}
-			if json.Unmarshal(raw, &album) == nil {
+			// Skip various-artists compilations ("Pure... Dance Party" and friends):
+			// their name, date, and cover all belong to the compilation, not the
+			// song's real album. Singles and regular albums are fine.
+			if json.Unmarshal(raw, &album) == nil && !isCompilation(album.AlbumType, album.Artists) {
 				if album.Name != "" {
 					track.Album = album.Name
 				}

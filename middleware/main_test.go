@@ -88,6 +88,65 @@ func TestBuildTrack(t *testing.T) {
 			},
 		},
 		{
+			name: "spotify compilation is skipped, falls back to audd album",
+			resp: &audd.Recognition{
+				Artist:      "Imagine Dragons",
+				Title:       "Warriors",
+				Album:       "Warriors",
+				ReleaseDate: "2014-09-18",
+				SongLink:    "https://lis.tn/Warriors",
+				Spotify: &audd.SpotifyMetadata{
+					DurationMs: 170000,
+					Extras: map[string]json.RawMessage{
+						"album": json.RawMessage(`{
+							"name": "Pure... Dance Party",
+							"album_type": "compilation",
+							"release_date": "2019-01-01",
+							"images": [{"url": "https://i.scdn.co/comp"}]
+						}`),
+					},
+				},
+			},
+			want: Track{
+				Album:         "Warriors",
+				AlbumCoverURL: "https://lis.tn/Warriors?thumb",
+				Artist:        "Imagine Dragons",
+				DurationS:     170,
+				ReleaseDate:   "2014-09-18",
+				Title:         "Warriors",
+			},
+		},
+		{
+			name: "spotify various-artists album is skipped",
+			resp: &audd.Recognition{
+				Artist:      "Imagine Dragons",
+				Title:       "Warriors",
+				Album:       "Warriors",
+				ReleaseDate: "2014-09-18",
+				SongLink:    "https://lis.tn/Warriors",
+				Spotify: &audd.SpotifyMetadata{
+					DurationMs: 170000,
+					Extras: map[string]json.RawMessage{
+						"album": json.RawMessage(`{
+							"name": "Massive Dance Hits",
+							"album_type": "album",
+							"release_date": "2019-01-01",
+							"artists": [{"name": "Various Artists"}],
+							"images": [{"url": "https://i.scdn.co/comp"}]
+						}`),
+					},
+				},
+			},
+			want: Track{
+				Album:         "Warriors",
+				AlbumCoverURL: "https://lis.tn/Warriors?thumb",
+				Artist:        "Imagine Dragons",
+				DurationS:     170,
+				ReleaseDate:   "2014-09-18",
+				Title:         "Warriors",
+			},
+		},
+		{
 			name: "musicbrainz prefers official studio album over compilation",
 			resp: &audd.Recognition{
 				Artist: "Imagine Dragons",
