@@ -71,7 +71,9 @@ func main() {
 		log.Fatal("AUDD_API_KEY is not set")
 	}
 
-	audDClient = audd.NewClient(audDApiKey)
+	// 20s is plenty for AudD (it usually answers in a few seconds) and keeps the
+	// UI from stalling in "identifying" for a full minute when a request hangs.
+	audDClient = audd.NewClient(audDApiKey, audd.WithStandardTimeout(20*time.Second))
 	defer audDClient.Close()
 
 	mux := http.NewServeMux()
