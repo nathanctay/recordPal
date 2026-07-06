@@ -1,36 +1,156 @@
-use hound::{SampleFormat, WavReader};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Error, FromSample, Sample, SampleFormat, SupportedStreamConfig};
+use hound::{WavReader, WavWriter};
 use json::object;
-use std::io::{Cursor, Write};
+use std::fs::File;
+use std::io::{BufWriter, Cursor, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex};
 
 const SOCKET_PATH: &str = "/tmp/nowplaying.sock";
-const DEFAULT_CLIP: &str = "sample.wav";
+const CLIP_PATH: &str = "clip.wav";
+const RECORD_SECS: u64 = 12;
+// Normalized RMS below this counts as silence — we skip the AudD call entirely.
+const SILENCE_THRESHOLD: f32 = 0.01;
 
-fn main() {
-    // Drop a 10–15s WAV here (or pass a path) to test against AudD.
-    // Real worker: cpal captures PCM → wrap as WAV → broadcast_clip.
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_CLIP.to_string());
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Testing: `cargo run -- some.wav` sends one existing clip and exits.
+    if let Some(path) = std::env::args().nth(1) {
+        let (wav, duration_s, rms_energy) = load_clip(&path)?;
+        broadcast_clip(&wav, duration_s, rms_energy)?;
+        println!("sent {duration_s}s clip ({} bytes)", wav.len());
+        return Ok(());
+    }
 
-    let (wav, duration_s, rms_energy) = match load_clip(&path) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("failed to load {path}: {e}");
-            eprintln!("place a WAV at {DEFAULT_CLIP} or run: cargo run -- /path/to/clip.wav");
-            std::process::exit(1);
+    // Worker: record → gate on loudness → send → repeat, forever.
+    run_capture_loop()
+}
+
+/// Continuously capture clips and forward loud ones to the middleware.
+fn run_capture_loop() -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        if let Err(e) = record_to_file(CLIP_PATH, RECORD_SECS) {
+            eprintln!("record error: {e}");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            continue;
         }
+
+        let (wav, duration_s, rms_energy) = match load_clip(CLIP_PATH) {
+            Ok(clip) => clip,
+            Err(e) => {
+                eprintln!("read error: {e}");
+                continue;
+            }
+        };
+
+        // Silence gate: don't spend an AudD lookup on a quiet room.
+        if rms_energy < SILENCE_THRESHOLD {
+            println!("silence (rms {rms_energy:.4}) — skipping");
+            continue;
+        }
+
+        match broadcast_clip(&wav, duration_s, rms_energy) {
+            Ok(()) => println!(
+                "sent {duration_s}s clip (rms {rms_energy:.4}, {} bytes)",
+                wav.len()
+            ),
+            Err(e) => eprintln!("broadcast error: {e}"),
+        }
+    }
+}
+
+/// Record `seconds` of audio from the default input device into a WAV file.
+fn record_to_file(path: &str, seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or("no default input device")?;
+    let config = device.default_input_config()?;
+    println!("recording {seconds}s from default mic ({config:?})");
+
+    let spec = wav_spec_from_config(&config);
+    let writer = WavWriter::create(path, spec)?;
+    let writer = Arc::new(Mutex::new(Some(writer)));
+    let writer_for_cb = writer.clone();
+
+    let err_fn = move |err: Error| eprintln!("stream error: {err}");
+
+    // The mic decides the sample format at runtime, so build the stream with a
+    // callback typed for whichever format it reports.
+    let stream = match config.sample_format() {
+        SampleFormat::I8 => device.build_input_stream(
+            config.into(),
+            move |data, _: &_| write_input_data::<i8, i8>(data, &writer_for_cb),
+            err_fn,
+            None,
+        )?,
+        SampleFormat::I16 => device.build_input_stream(
+            config.into(),
+            move |data, _: &_| write_input_data::<i16, i16>(data, &writer_for_cb),
+            err_fn,
+            None,
+        )?,
+        SampleFormat::I32 => device.build_input_stream(
+            config.into(),
+            move |data, _: &_| write_input_data::<i32, i32>(data, &writer_for_cb),
+            err_fn,
+            None,
+        )?,
+        SampleFormat::F32 => device.build_input_stream(
+            config.into(),
+            move |data, _: &_| write_input_data::<f32, f32>(data, &writer_for_cb),
+            err_fn,
+            None,
+        )?,
+        other => return Err(format!("unsupported sample format {other:?}").into()),
     };
 
-    match broadcast_clip(&wav, duration_s, rms_energy) {
-        Ok(()) => println!(
-            "sent {duration_s}s clip ({} bytes) to {SOCKET_PATH}",
-            wav.len()
-        ),
-        Err(e) => {
-            eprintln!("broadcast failed: {e}");
-            std::process::exit(1);
+    stream.play()?;
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+    drop(stream); // stops capture; no more callbacks fire
+
+    // Take the writer out of the shared cell so we can consume it in finalize().
+    writer
+        .lock()
+        .unwrap()
+        .take()
+        .expect("writer already taken")
+        .finalize()?;
+    Ok(())
+}
+
+/// Copy captured samples into the WAV writer. Runs on the audio thread
+fn write_input_data<T, U>(input: &[T], writer: &WavWriterHandle)
+where
+    T: Sample,
+    U: Sample + hound::Sample + FromSample<T>,
+{
+    if let Ok(mut guard) = writer.try_lock() {
+        if let Some(writer) = guard.as_mut() {
+            for &sample in input.iter() {
+                let sample: U = U::from_sample(sample);
+                writer.write_sample(sample).ok();
+            }
         }
+    }
+}
+
+type WavWriterHandle = Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>;
+
+fn wav_spec_from_config(config: &SupportedStreamConfig) -> hound::WavSpec {
+    hound::WavSpec {
+        channels: config.channels() as _,
+        sample_rate: config.sample_rate() as _,
+        bits_per_sample: (config.sample_format().sample_size() * 8) as _,
+        sample_format: to_hound_format(config.sample_format()),
+    }
+}
+
+fn to_hound_format(format: SampleFormat) -> hound::SampleFormat {
+    if format.is_float() {
+        hound::SampleFormat::Float
+    } else {
+        hound::SampleFormat::Int
     }
 }
 
@@ -56,14 +176,14 @@ fn wav_rms_energy(wav: &[u8]) -> std::io::Result<f32> {
     let mut count = 0u64;
 
     match spec.sample_format {
-        SampleFormat::Int => {
+        hound::SampleFormat::Int => {
             for sample in reader.samples::<i32>() {
                 let n = sample.map_err(std::io::Error::other)? as f64 / scale;
                 sum_sq += n * n;
                 count += 1;
             }
         }
-        SampleFormat::Float => {
+        hound::SampleFormat::Float => {
             for sample in reader.samples::<f32>() {
                 let n = sample.map_err(std::io::Error::other)? as f64;
                 sum_sq += n * n;
