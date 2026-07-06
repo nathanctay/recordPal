@@ -88,7 +88,8 @@ func main() {
 	if err != nil {
 		log.Fatal("Could not connect to Audio Worker\n", "err: ", err)
 	}
-	go handleIdentify(eventBroker, stateBroker, socket)
+	engine := newIdentifyEngine(eventBroker, stateBroker, 30*time.Second)
+	go handleIdentify(engine, socket)
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
@@ -102,26 +103,123 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }
 
-func handleIdentify(trackBroker *SSEBroker[Track], stateBroker *SSEBroker[IdentifierState], socket net.Listener) {
+const idleTimeout = 30 * time.Second
+
+// identifyEngine owns clip processing, idle timing, and track debouncing.
+// One engine per process so idle state and current track survive per-clip connections.
+type identifyEngine struct {
+	trackBroker *SSEBroker[Track]
+	stateBroker *SSEBroker[IdentifierState]
+
+	mu          sync.Mutex
+	generation  uint64
+	currentTrack Track
+	identifyMu  sync.Mutex // serialize AudD calls
+
+	idleMu      sync.Mutex
+	idleTimer   *time.Timer
+	idleTimeout time.Duration
+}
+
+func newIdentifyEngine(
+	trackBroker *SSEBroker[Track],
+	stateBroker *SSEBroker[IdentifierState],
+	idleTimeout time.Duration,
+) *identifyEngine {
+	return &identifyEngine{
+		trackBroker: trackBroker,
+		stateBroker: stateBroker,
+		idleTimeout: idleTimeout,
+	}
+}
+
+func (e *identifyEngine) resetIdleTimer() {
+	e.idleMu.Lock()
+	defer e.idleMu.Unlock()
+	if e.idleTimer != nil {
+		e.idleTimer.Stop()
+	}
+	e.idleTimer = time.AfterFunc(e.idleTimeout, func() {
+		e.stateBroker.publish(StateIdle)
+	})
+}
+
+func sameTrack(a, b Track) bool {
+	return a.Title == b.Title && a.Artist == b.Artist
+}
+
+// applyResult publishes track/state updates for a finished identification.
+// Returns false when gen is stale and the result was discarded.
+func (e *identifyEngine) applyResult(gen uint64, track Track, err error) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if gen != e.generation {
+		return false
+	}
+
+	if err != nil {
+		log.Println("error identifying song:", err)
+		e.stateBroker.publish(StateError)
+		return true
+	}
+
+	if track.Title == "" {
+		// AudD no-match: keep whatever is already on screen.
+		if e.currentTrack.Title != "" {
+			e.stateBroker.publish(StateListening)
+		}
+		return true
+	}
+
+	if sameTrack(track, e.currentTrack) {
+		e.stateBroker.publish(StateListening)
+		return true
+	}
+
+	e.currentTrack = track
+	e.trackBroker.publish(track)
+	e.stateBroker.publish(StateListening)
+	return true
+}
+
+func (e *identifyEngine) processClip(audio []byte) {
+	e.resetIdleTimer()
+
+	e.mu.Lock()
+	e.generation++
+	gen := e.generation
+	e.mu.Unlock()
+
+	e.stateBroker.publish(StateIdentifying)
+
+	e.identifyMu.Lock()
+	defer e.identifyMu.Unlock()
+
+	e.mu.Lock()
+	stale := gen != e.generation
+	e.mu.Unlock()
+	if stale {
+		return
+	}
+
+	track, err := identifySong(audio)
+	e.applyResult(gen, track, err)
+}
+
+func handleIdentify(engine *identifyEngine, socket net.Listener) {
 	for {
 		conn, err := socket.Accept()
 		if err != nil {
 			log.Println("socket accept error:", err)
-			return
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 
 		go func(conn net.Conn) {
 			defer conn.Close()
 
 			reader := bufio.NewReaderSize(conn, 64*1024)
-
-			const idleTimeout = 30 * time.Second
-			// switch our listening status to idle after 30 seconds
-			idleTimer := time.AfterFunc(idleTimeout, func() {
-				stateBroker.publish(StateIdle)
-			})
-			defer idleTimer.Stop()
-
 			for {
 				audio, err := readClip(reader)
 				if err != nil {
@@ -131,23 +229,9 @@ func handleIdentify(trackBroker *SSEBroker[Track], stateBroker *SSEBroker[Identi
 					return
 				}
 
-				idleTimer.Reset(idleTimeout)
-				stateBroker.publish(StateIdentifying) // find the best place to do this
-
-				//identify the song
-				track, err := identifySong(audio)
-				if err != nil {
-					log.Println("error identifying song:", err)
-					stateBroker.publish(StateError)
-					continue
-				}
-
-				// broadcast the value to the frontend
-				trackBroker.publish(track)
-				stateBroker.publish(StateListening)
+				go engine.processClip(audio)
 			}
 		}(conn)
-
 	}
 }
 

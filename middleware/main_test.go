@@ -410,3 +410,97 @@ func publishUntil[E Track | IdentifierState](t *testing.T, broker *SSEBroker[E],
 	}
 	t.Fatalf("body never contained %q:\n%s", wantInBody, rec.Body.String())
 }
+
+func TestSameTrack(t *testing.T) {
+	a := Track{Title: "Warriors", Artist: "Imagine Dragons"}
+	b := Track{Title: "Warriors", Artist: "Imagine Dragons"}
+	c := Track{Title: "Believer", Artist: "Imagine Dragons"}
+
+	if !sameTrack(a, b) {
+		t.Fatal("expected same track")
+	}
+	if sameTrack(a, c) {
+		t.Fatal("expected different tracks")
+	}
+}
+
+func TestApplyResultStaleGeneration(t *testing.T) {
+	trackBroker := newBroker[Track]()
+	stateBroker := newBroker[IdentifierState]()
+	engine := newIdentifyEngine(trackBroker, stateBroker, time.Minute)
+
+	engine.generation = 2
+	published := engine.applyResult(1, Track{Title: "Warriors", Artist: "Imagine Dragons"}, nil)
+	if published {
+		t.Fatal("expected stale result to be discarded")
+	}
+}
+
+func TestApplyResultNoMatchKeepsCurrentTrack(t *testing.T) {
+	trackBroker := newBroker[Track]()
+	stateBroker := newBroker[IdentifierState]()
+	engine := newIdentifyEngine(trackBroker, stateBroker, time.Minute)
+	engine.generation = 1
+	engine.currentTrack = Track{Title: "Warriors", Artist: "Imagine Dragons"}
+
+	stateCh := stateBroker.Subscribe()
+	defer stateBroker.Unsubscribe(stateCh)
+
+	if !engine.applyResult(1, Track{}, nil) {
+		t.Fatal("expected no-match result to be handled")
+	}
+
+	select {
+	case state := <-stateCh:
+		if state != StateListening {
+			t.Fatalf("state = %q, want %q", state, StateListening)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for listening state")
+	}
+}
+
+func TestApplyResultDebouncesSameTrack(t *testing.T) {
+	trackBroker := newBroker[Track]()
+	stateBroker := newBroker[IdentifierState]()
+	engine := newIdentifyEngine(trackBroker, stateBroker, time.Minute)
+	engine.generation = 1
+	engine.currentTrack = Track{Title: "Warriors", Artist: "Imagine Dragons"}
+
+	trackCh := trackBroker.Subscribe()
+	defer trackBroker.Unsubscribe(trackCh)
+
+	if !engine.applyResult(1, Track{Title: "Warriors", Artist: "Imagine Dragons"}, nil) {
+		t.Fatal("expected same-track result to be handled")
+	}
+
+	select {
+	case <-trackCh:
+		t.Fatal("did not expect a duplicate track publish")
+	default:
+	}
+}
+
+func TestApplyResultPublishesNewTrack(t *testing.T) {
+	trackBroker := newBroker[Track]()
+	stateBroker := newBroker[IdentifierState]()
+	engine := newIdentifyEngine(trackBroker, stateBroker, time.Minute)
+	engine.generation = 1
+
+	trackCh := trackBroker.Subscribe()
+	defer trackBroker.Unsubscribe(trackCh)
+
+	want := Track{Title: "Warriors", Artist: "Imagine Dragons"}
+	if !engine.applyResult(1, want, nil) {
+		t.Fatal("expected new track to be published")
+	}
+
+	select {
+	case got := <-trackCh:
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("track = %+v, want %+v", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for track publish")
+	}
+}
