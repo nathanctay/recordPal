@@ -53,10 +53,18 @@ function App() {
     const stateSource = new EventSource('http://localhost:8080/state')
 
     trackSource.addEventListener('track', (e) => {
-      setCurrentTrack(JSON.parse(e.data))
+      try {
+        setCurrentTrack(JSON.parse(e.data))
+      } catch {
+        // ignore malformed SSE payloads
+      }
     })
     stateSource.addEventListener('state', (e) => {
-      setCurrentState(JSON.parse(e.data))
+      try {
+        setCurrentState(JSON.parse(e.data))
+      } catch {
+        // ignore malformed SSE payloads
+      }
     })
 
     return () => {
