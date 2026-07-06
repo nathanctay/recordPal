@@ -1,0 +1,16 @@
+[Unit]
+Description=RecordPal WiFi captive portal (balena wifi-connect)
+After=NetworkManager.service
+Wants=NetworkManager.service
+# App units order themselves after this so setup finishes before they start.
+Before=now-playing.service
+
+[Service]
+Type=simple
+# wifi-connect checks connectivity first: if the Pi is already online it exits
+# immediately; otherwise it opens the "RecordPal-Setup" portal until connected.
+ExecStart=/opt/recordpal/wifi-connect --portal-ssid RecordPal-Setup
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

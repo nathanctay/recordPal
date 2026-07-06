@@ -1,0 +1,26 @@
+[Unit]
+Description=RecordPal kiosk display (Chromium)
+After=now-playing.service
+Wants=now-playing.service
+
+[Service]
+User=pi
+# Adjust for your display stack. This assumes an X session on :0.
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+# The UI is a static bundle. For now the kiosk loads it directly from disk; the
+# page opens an SSE connection to the Go service on http://localhost:8080.
+# NOTE: once the Go service serves the UI itself, point this at
+# http://localhost:8080 instead of the file:// path.
+ExecStart=/usr/bin/chromium-browser \
+  --kiosk \
+  --noerrdialogs \
+  --disable-infobars \
+  --disable-session-crashed-bubble \
+  --check-for-update-interval=31536000 \
+  file:///opt/recordpal/ui/index.html
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical.target

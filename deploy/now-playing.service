@@ -1,0 +1,18 @@
+[Unit]
+Description=RecordPal now-playing service (Go)
+After=network-online.target wifi-connect.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/recordpal
+# AUDD_API_KEY lives here. The leading "-" makes it optional so the unit still
+# starts (and logs the missing key) if the file isn't present yet.
+EnvironmentFile=-/opt/recordpal/.env
+ExecStart=/opt/recordpal/now-playing
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

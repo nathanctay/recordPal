@@ -1,0 +1,16 @@
+[Unit]
+Description=RecordPal audio worker (Rust)
+# The worker connects to the socket the Go service owns, so start it after.
+After=now-playing.service
+Requires=now-playing.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/recordpal
+ExecStart=/opt/recordpal/audio-worker
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

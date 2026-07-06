@@ -1,0 +1,101 @@
+# RecordPal — Raspberry Pi build & deploy (SCAFFOLD)
+#
+# You don't need the Pi to read this — it documents the intended pipeline and
+# will work once you have a device. Every variable is overridable, e.g.:
+#
+#   make -f Makefile.pi deploy PI_HOST=192.168.1.42 PI_USER=nathan
+#
+# Host prerequisites:
+#   - Go   (cross-compiles to arm64 with no extra toolchain; CGO disabled)
+#   - Node + npm (UI build)
+#   - A Rust arm64 cross-compiler (see CARGO_CROSS note below)
+#   - ssh + rsync access to the Pi
+#
+# Known gaps to revisit before this fully works (see notes at bottom):
+#   - the Go service does not serve the UI yet (kiosk loads it via file://)
+#   - systemd units in deploy/ assume User=pi and /opt/recordpal paths
+
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
+
+# --- Config (override on the command line) ---
+PI_USER   ?= pi
+PI_HOST   ?= recordpal.local
+PI_TARGET := $(PI_USER)@$(PI_HOST)
+# install location on the device
+PI_DIR    ?= /opt/recordpal
+# local staging dir for built artifacts
+DIST      ?= dist/pi
+
+RUST_TARGET ?= aarch64-unknown-linux-gnu
+# Rust cross-compile driver. RECOMMENDED: `cross` — Docker-based, matches the
+# README's dockerized pipeline and needs no host linker setup.
+#   Prereq: `cargo install cross` and a running Docker daemon.
+# Alternatives you can drop in via CARGO_CROSS=...:
+#   - `cargo-zigbuild` (no Docker, but needs zig installed)
+#   - build natively on the Pi instead (rsync source, run `cargo build` there)
+CARGO_CROSS ?= cross
+
+# balena wifi-connect release to bundle (captive portal for first-boot WiFi).
+# Check for the latest tag: https://github.com/balena-os/wifi-connect/releases
+WIFI_CONNECT_VERSION ?= v4.11.85
+WIFI_CONNECT_ARCH    ?= aarch64
+
+SERVICES := now-playing audio-worker kiosk wifi-connect
+
+.PHONY: help build build-server build-audio build-ui fetch-wifi-connect \
+        deploy install-units restart logs ssh clean
+
+help: ## Show available targets
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | \
+		awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+
+## --- Cross-compile ---
+
+build: build-server build-audio build-ui ## Cross-compile everything into $(DIST)
+
+build-server: ## Cross-compile the Go middleware for arm64
+	mkdir -p $(DIST)
+	cd middleware && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../$(DIST)/now-playing .
+
+build-audio: ## Cross-compile the Rust audio worker for arm64
+	mkdir -p $(DIST)
+	cd audio && $(CARGO_CROSS) build --release --target $(RUST_TARGET)
+	cp audio/target/$(RUST_TARGET)/release/audio $(DIST)/audio-worker
+
+build-ui: ## Build the UI static bundle into $(DIST)/ui
+	cd ui && npm run build
+	rm -rf $(DIST)/ui && mkdir -p $(DIST)/ui
+	cp -R ui/dist/. $(DIST)/ui/
+
+fetch-wifi-connect: ## Download balena wifi-connect (arm64) into $(DIST)
+	mkdir -p $(DIST)
+	curl -fsSL -o $(DIST)/wifi-connect.tar.gz \
+		https://github.com/balena-os/wifi-connect/releases/download/$(WIFI_CONNECT_VERSION)/wifi-connect-$(WIFI_CONNECT_ARCH)-unknown-linux-gnu.tar.gz
+	tar -xzf $(DIST)/wifi-connect.tar.gz -C $(DIST)
+
+## --- Deploy ---
+
+deploy: build ## Cross-compile, sync to the Pi, install units, restart
+	ssh $(PI_TARGET) 'sudo mkdir -p $(PI_DIR) && sudo chown $(PI_USER) $(PI_DIR)'
+	rsync -avz --delete $(DIST)/ $(PI_TARGET):$(PI_DIR)/
+	$(MAKE) -f Makefile.pi install-units
+	ssh $(PI_TARGET) 'sudo systemctl restart $(SERVICES)'
+
+install-units: ## Copy systemd unit files to the Pi and enable them
+	rsync -avz deploy/*.service $(PI_TARGET):$(PI_DIR)/units/
+	ssh $(PI_TARGET) 'sudo cp $(PI_DIR)/units/*.service /etc/systemd/system/ && \
+		sudo systemctl daemon-reload && \
+		sudo systemctl enable $(SERVICES)'
+
+restart: ## Restart all services on the Pi
+	ssh $(PI_TARGET) 'sudo systemctl restart $(SERVICES)'
+
+logs: ## Tail logs for all services
+	ssh $(PI_TARGET) 'sudo journalctl -f -u now-playing -u audio-worker -u kiosk -u wifi-connect'
+
+ssh: ## Open a shell on the Pi
+	ssh $(PI_TARGET)
+
+clean: ## Remove the local staging dir
+	rm -rf $(DIST)
