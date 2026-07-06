@@ -11,7 +11,7 @@ const SOCKET_PATH: &str = "/tmp/nowplaying.sock";
 const CLIP_PATH: &str = "clip.wav";
 const RECORD_SECS: u64 = 12;
 // Normalized RMS below this counts as silence — we skip the AudD call entirely.
-const SILENCE_THRESHOLD: f32 = 0.01;
+const SILENCE_THRESHOLD: f32 = 0.003;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Testing: `cargo run -- some.wav` sends one existing clip and exits.
